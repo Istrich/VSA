@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,8 @@ class SQLiteMetadataDB:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
         return conn
 
     def initialize(self) -> None:
@@ -46,6 +49,12 @@ class SQLiteMetadataDB:
 
                 CREATE INDEX IF NOT EXISTS idx_media_hash ON media(hash);
                 CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at);
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_version(version)
+                SELECT 1
+                WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
                 CREATE TABLE IF NOT EXISTS video_keyframes (
                     frame_media_id TEXT PRIMARY KEY,
@@ -81,14 +90,18 @@ class SQLiteMetadataDB:
 
     def upsert_media(self, media: MediaFile) -> None:
         """Insert or update media metadata record."""
+        try:
+            metadata_json = json.dumps(media.metadata_json, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("media.metadata_json must be JSON-serializable.") from exc
+
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO media (id, path, hash, caption, created_at, metadata_json)
                 VALUES (:id, :path, :hash, :caption, :created_at, :metadata_json)
-                ON CONFLICT(id) DO UPDATE SET
+                ON CONFLICT(hash) DO UPDATE SET
                     path=excluded.path,
-                    hash=excluded.hash,
                     caption=excluded.caption,
                     created_at=excluded.created_at,
                     metadata_json=excluded.metadata_json;
@@ -99,7 +112,7 @@ class SQLiteMetadataDB:
                     "hash": media.file_hash,
                     "caption": media.caption,
                     "created_at": media.created_at.isoformat(),
-                    "metadata_json": json.dumps(media.metadata_json, ensure_ascii=False),
+                    "metadata_json": metadata_json,
                 },
             )
 
@@ -113,6 +126,10 @@ class SQLiteMetadataDB:
 
     def search_captions(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         """Keyword search over caption index through FTS5."""
+        safe_query = self._sanitize_fts_query(query)
+        if not safe_query:
+            return []
+
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -128,9 +145,18 @@ class SQLiteMetadataDB:
                 ORDER BY fts_score ASC
                 LIMIT ?;
                 """,
-                (query, limit),
+                (safe_query, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def rebind_path_by_hash(self, file_hash: str, new_path: str) -> bool:
+        """Update stored path for an existing hash, return True if updated."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE media SET path = ? WHERE hash = ? AND path != ?;",
+                (new_path, file_hash, new_path),
+            )
+            return cursor.rowcount > 0
 
     def get_media_by_paths(self, paths: list[str]) -> list[dict[str, Any]]:
         """Return metadata rows for a list of absolute file paths."""
@@ -203,6 +229,15 @@ class SQLiteMetadataDB:
         if row is None or row["timestamp_sec"] is None:
             return None
         return float(row["timestamp_sec"])
+
+    @staticmethod
+    def _sanitize_fts_query(query: str) -> str:
+        """Build conservative FTS5 query from user text."""
+        tokens = re.findall(r"\w+", query, flags=re.UNICODE)
+        if not tokens:
+            return ""
+        escaped = [f"\"{token.replace('\"', '\"\"')}\"" for token in tokens]
+        return " AND ".join(escaped)
 
 
 class ChromaVectorStore:

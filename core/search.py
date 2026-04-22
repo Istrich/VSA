@@ -4,22 +4,12 @@ from __future__ import annotations
 
 import json
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .db import ChromaVectorStore, SQLiteMetadataDB
+from .models import SearchQuery, SearchWeights
 from .vision import InferenceService
-
-
-@dataclass
-class SearchWeights:
-    """Weights for hybrid score branches."""
-
-    clip: float = 0.5
-    face: float = 0.4
-    fts: float = 0.1
-
 
 class HybridSearchEngine:
     """Performs hybrid retrieval and weighted reranking."""
@@ -39,12 +29,19 @@ class HybridSearchEngine:
 
     def search(
         self,
+        query: SearchQuery | None = None,
         text_query: str = "",
         face_reference_path: str | None = None,
         top_k: int = 20,
         weights: SearchWeights | None = None,
     ) -> list[dict[str, Any]]:
         """Run CLIP+Face+FTS search and return ranked results."""
+        if query is not None:
+            text_query = query.text or ""
+            face_reference_path = query.face_reference_path
+            top_k = query.top_k
+            if weights is None:
+                weights = SearchWeights(**query.weights)
         scoring = weights or SearchWeights()
         candidates: dict[str, dict[str, Any]] = {}
 
@@ -264,13 +261,17 @@ class HybridSearchEngine:
             return self.search(text_query=text_query, top_k=top_k, weights=weights)
 
         suffix = uploaded_suffix if uploaded_suffix.startswith(".") else f".{uploaded_suffix}"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(uploaded_bytes)
             tmp.flush()
+            tmp_path = tmp.name
+        try:
             return self.search(
                 text_query=text_query,
-                face_reference_path=tmp.name,
+                face_reference_path=tmp_path,
                 top_k=top_k,
                 weights=weights,
             )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 

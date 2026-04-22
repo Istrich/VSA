@@ -1,0 +1,11 @@
+streamlit
+pydantic>=2
+httpx
+chromadb
+open_clip_torch
+insightface
+onnxruntime-gpu
+torch
+opencv-python
+numpy
+Pillow

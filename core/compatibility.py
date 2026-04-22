@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from .db import ChromaVectorStore, SQLiteMetadataDB
+from .models import ModelRegistry
 
 
 @dataclass
@@ -30,7 +31,11 @@ def run_compatibility_checks(data_dir: str | Path = "./data") -> list[CheckResul
     results.append(_check_storage_co_location(data_dir))
     results.append(_check_ollama_health())
     results.append(_check_onnxruntime_gpu_cuda_compat())
-    results.append(_check_ffmpeg_path())
+    results.append(_check_torch_cuda_runtime())
+    results.append(_check_ffmpeg_path("ffmpeg"))
+    results.append(_check_ffmpeg_path("ffprobe"))
+    results.append(_check_model_files())
+    results.append(_check_chromadb_version())
     return results
 
 
@@ -114,48 +119,100 @@ def _check_onnxruntime_gpu_cuda_compat() -> CheckResult:
             details="Package `onnxruntime-gpu` is not installed.",
         )
 
-    if ort_version.startswith("1.17."):
+    if ort_version.startswith(("1.17.", "1.18.", "1.19.", "1.20.")):
         return CheckResult(
             name="InsightFace / onnxruntime-gpu",
             status="PASS",
-            details=f"onnxruntime-gpu={ort_version} (expected line: 1.17.x for CUDA 12.1).",
+            details=f"onnxruntime-gpu={ort_version} (supported range: 1.17+).",
         )
 
     return CheckResult(
         name="InsightFace / onnxruntime-gpu",
         status="WARN",
-        details=f"onnxruntime-gpu={ort_version}; recommended 1.17.x for CUDA 12.1.",
+        details=f"onnxruntime-gpu={ort_version}; verify CUDA provider compatibility for your host.",
     )
 
 
-def _check_ffmpeg_path() -> CheckResult:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
+def _check_torch_cuda_runtime() -> CheckResult:
+    try:
+        import torch
+    except ImportError:
         return CheckResult(
-            name="FFmpeg in PATH",
+            name="PyTorch runtime",
             status="FAIL",
-            details="`ffmpeg` executable not found in PATH.",
+            details="Package `torch` is not installed.",
+        )
+
+    cuda_available = torch.cuda.is_available()
+    cuda_version = torch.version.cuda or "unknown"
+    status = "PASS" if cuda_available else "WARN"
+    details = f"torch={torch.__version__}, cuda_available={cuda_available}, cuda_version={cuda_version}"
+    if not cuda_available:
+        details += " (CPU fallback required)"
+    return CheckResult(name="PyTorch runtime", status=status, details=details)
+
+
+def _check_ffmpeg_path(binary_name: str) -> CheckResult:
+    binary = shutil.which(binary_name)
+    if not binary:
+        return CheckResult(
+            name=f"{binary_name} in PATH",
+            status="FAIL",
+            details=f"`{binary_name}` executable not found in PATH.",
         )
 
     try:
         proc = subprocess.run(
-            [ffmpeg, "-version"],
+            [binary, "-version"],
             check=True,
             capture_output=True,
             text=True,
         )
         first_line = proc.stdout.splitlines()[0] if proc.stdout else "ffmpeg found"
         return CheckResult(
-            name="FFmpeg in PATH",
+            name=f"{binary_name} in PATH",
             status="PASS",
             details=first_line,
         )
     except Exception as exc:  # pragma: no cover
         return CheckResult(
-            name="FFmpeg in PATH",
+            name=f"{binary_name} in PATH",
             status="WARN",
-            details=f"`ffmpeg` found but version probe failed: {exc}",
+            details=f"`{binary_name}` found but version probe failed: {exc}",
         )
+
+
+def _check_model_files() -> CheckResult:
+    registry = ModelRegistry()
+    status_map = registry.get_model_status()
+    missing = [name for name, status in status_map.items() if status != "FOUND"]
+    if not missing:
+        return CheckResult(
+            name="Model files on disk",
+            status="PASS",
+            details="All required model files are present.",
+        )
+    return CheckResult(
+        name="Model files on disk",
+        status="WARN",
+        details=f"Missing models: {', '.join(missing)}",
+    )
+
+
+def _check_chromadb_version() -> CheckResult:
+    try:
+        version = metadata.version("chromadb")
+    except metadata.PackageNotFoundError:
+        return CheckResult(
+            name="ChromaDB package",
+            status="FAIL",
+            details="Package `chromadb` is not installed.",
+        )
+    return CheckResult(
+        name="ChromaDB package",
+        status="PASS",
+        details=f"chromadb={version}",
+    )
 
 
 def _is_under(path: Path, base: Path) -> bool:

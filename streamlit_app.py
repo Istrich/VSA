@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
 from core.compatibility import run_compatibility_checks
+from core.indexer import MediaIndexer
 from core.model_downloader import ModelDownloader
-from core.models import ModelRegistry
-from core.search import HybridSearchEngine, SearchWeights
+from core.models import ModelRegistry, SearchWeights
+from core.search import HybridSearchEngine
 
 
 @st.cache_resource(show_spinner=False)
@@ -31,6 +33,12 @@ def get_model_downloader() -> ModelDownloader:
     return ModelDownloader()
 
 
+@st.cache_resource(show_spinner=False)
+def get_indexer() -> MediaIndexer:
+    """Create media indexer for ingestion tab."""
+    return MediaIndexer()
+
+
 def render_result_card(result: dict[str, Any]) -> None:
     """Render one search result with preview and metadata."""
     path = result.get("path", "")
@@ -39,8 +47,16 @@ def render_result_card(result: dict[str, Any]) -> None:
     caption = result.get("caption") or "No caption available"
 
     with st.container(border=True):
-        if path_obj.exists() and path_obj.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+        suffix = path_obj.suffix.lower()
+        if path_obj.exists() and suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
             st.image(str(path_obj), use_container_width=True)
+        elif path_obj.exists() and suffix in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+            start_time = 0.0
+            if isinstance(metadata, dict):
+                ts = metadata.get("best_frame_timestamp_sec")
+                if isinstance(ts, (int, float)):
+                    start_time = float(ts)
+            st.video(str(path_obj), start_time=start_time)
         else:
             st.markdown("**Preview unavailable**")
 
@@ -59,6 +75,30 @@ def render_result_card(result: dict[str, Any]) -> None:
             if isinstance(ts, (float, int)):
                 st.caption(f"Best match timestamp: {float(ts):.2f}s")
             st.json(metadata, expanded=False)
+        st.code(path, language=None)
+
+
+def render_index_tab() -> None:
+    """Render indexing workflow with basic controls."""
+    st.subheader("Index Media Directory")
+    root_dir = st.text_input("Directory path", value=".")
+    keyframe_interval = st.number_input("Keyframe interval (sec)", min_value=1, value=2, step=1)
+    scene_delta = st.slider("Scene delta threshold", min_value=1.0, max_value=50.0, value=15.0)
+    if st.button("Run Indexing", type="primary"):
+        indexer = get_indexer()
+        with st.spinner("Indexing media..."):
+            stats = asyncio.run(
+                indexer.index_directory(
+                    root_directory=root_dir,
+                    keyframe_interval_sec=int(keyframe_interval),
+                    scene_delta_threshold=float(scene_delta),
+                )
+            )
+        st.success(
+            f"Indexed: {stats.get('indexed', 0)} | "
+            f"Skipped: {stats.get('skipped', 0)} | "
+            f"Failed: {stats.get('failed', 0)}"
+        )
 
 
 def render_search_tab() -> None:
@@ -169,9 +209,11 @@ def main() -> None:
     st.title("Vision Semantic Archive")
     st.caption("Hybrid Search: text query + optional face reference")
 
-    tab_search, tab_settings = st.tabs(["Search", "Settings/Status"])
+    tab_search, tab_index, tab_settings = st.tabs(["Search", "Index", "Settings/Status"])
     with tab_search:
         render_search_tab()
+    with tab_index:
+        render_index_tab()
     with tab_settings:
         render_settings_status_tab()
 

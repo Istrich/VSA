@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -54,13 +53,36 @@ class SearchQuery(BaseModel):
     )
 
 
-@dataclass(frozen=True)
-class ModelSpec:
+class SearchWeights(BaseModel):
+    """Normalized hybrid scoring weights."""
+
+    clip: float = 0.5
+    face: float = 0.4
+    fts: float = 0.1
+
+
+class SearchResult(BaseModel):
+    """Search API result payload."""
+
+    path: str
+    score: float
+    clip_sim: float
+    face_sim: float
+    fts_score: float
+    id: str | None = None
+    caption: str | None = None
+    created_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    best_frame_timestamp_sec: float | None = None
+
+
+class ModelSpec(BaseModel):
     """Single model artifact expected on disk."""
 
     name: str
     relative_path: str
     download_url: str
+    sha256: str | None = None
 
 
 class ModelRegistry:
@@ -78,9 +100,9 @@ class ModelRegistry:
             ),
             ModelSpec(
                 name="insightface_buffalo_l",
-                relative_path="faces/buffalo_l/model.onnx",
+                relative_path="faces/buffalo_l/w600k_r50.onnx",
                 download_url=(
-                    "https://huggingface.co/monsterapi/insightface/resolve/main/models/buffalo_l/w600k_r50.onnx"
+                    "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
                 ),
             ),
         )

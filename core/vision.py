@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -54,24 +56,16 @@ class InferenceService:
 
         self._initialized = True
         self.max_vram_gb = max_vram_gb
-        self.device = "cuda"
-
-        self._assert_cuda_runtime()
-
-        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
-            clip_model_name,
-            pretrained=clip_pretrained,
-            device=self.device,
-        )
-        self.clip_model.eval()
-
-        self.face_analyzer = FaceAnalysis(
-            name=face_model_name,
-            providers=["CUDAExecutionProvider"],
-        )
-        self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
-
-        self._warm_up_models()
+        self._logger = logging.getLogger(__name__)
+        self.device = "cpu"
+        self._allow_cpu = os.getenv("VSA_ALLOW_CPU", "1").strip() == "1"
+        self._ready = False
+        self._clip_model_name = clip_model_name
+        self._clip_pretrained = clip_pretrained
+        self._face_model_name = face_model_name
+        self.clip_model = None
+        self.clip_preprocess = None
+        self.face_analyzer = None
 
     def _assert_cuda_runtime(self) -> None:
         if not torch.cuda.is_available():
@@ -92,8 +86,55 @@ class InferenceService:
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("Failed to initialize CUDA device 0.") from exc
 
+    def ensure_ready(self) -> None:
+        """Lazily initialize CLIP/InsightFace models on first real use."""
+        if self._ready:
+            return
+        with self._instance_lock:
+            if self._ready:
+                return
+            self._initialize_models()
+            self._ready = True
+
+    def _initialize_models(self) -> None:
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            self._assert_cuda_runtime()
+            self.device = "cuda"
+        elif not self._allow_cpu:
+            raise RuntimeError(
+                "CUDA is unavailable and CPU fallback is disabled. Set VSA_ALLOW_CPU=1 for dev mode."
+            )
+        else:
+            self.device = "cpu"
+            self._logger.warning("VSA vision is running in CPU fallback mode.")
+
+        local_clip_weights = Path("./models/vision/open_clip_vit_l_14/model.safetensors").resolve()
+        clip_pretrained_source = (
+            str(local_clip_weights) if local_clip_weights.exists() else self._clip_pretrained
+        )
+        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+            self._clip_model_name,
+            pretrained=clip_pretrained_source,
+            device=self.device,
+        )
+        self.clip_model.eval()
+
+        insightface_home = Path(os.getenv("INSIGHTFACE_HOME", "./models/faces")).resolve()
+        insightface_home.mkdir(parents=True, exist_ok=True)
+        providers = ["CUDAExecutionProvider"] if self.device == "cuda" else ["CPUExecutionProvider"]
+        self.face_analyzer = FaceAnalysis(
+            name=self._face_model_name,
+            providers=providers,
+            root=str(insightface_home),
+        )
+        self.face_analyzer.prepare(ctx_id=0 if self.device == "cuda" else -1, det_size=(640, 640))
+        self._warm_up_models()
+
     def _warm_up_models(self) -> None:
         """Run lightweight warm-up passes to stabilize first-request latency."""
+        if self.clip_model is None or self.face_analyzer is None:
+            raise RuntimeError("Inference models are not initialized.")
         image_size = self.clip_model.visual.image_size
         if isinstance(image_size, tuple):
             height, width = image_size
@@ -110,7 +151,8 @@ class InferenceService:
 
     def _cleanup_vram(self) -> None:
         gc.collect()
-        torch.cuda.empty_cache()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
     def get_clip_embedding(self, image_path: str | Path) -> list[float]:
         """Return normalized CLIP embedding vector for an image."""
@@ -128,6 +170,9 @@ class InferenceService:
 
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
+        self.ensure_ready()
+        if self.clip_model is None or self.clip_preprocess is None:
+            raise RuntimeError("CLIP model is not initialized.")
 
         normalized_paths = [Path(path) for path in image_paths]
         for image_path in normalized_paths:
@@ -158,6 +203,9 @@ class InferenceService:
         """Return normalized CLIP embedding vector for text query."""
         if not text.strip():
             raise ValueError("Text query cannot be empty for CLIP text embedding.")
+        self.ensure_ready()
+        if self.clip_model is None:
+            raise RuntimeError("CLIP model is not initialized.")
 
         try:
             tokens = open_clip.tokenize([text]).to(self.device)
@@ -175,6 +223,9 @@ class InferenceService:
         image_path = Path(image_path)
         if not image_path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
+        self.ensure_ready()
+        if self.face_analyzer is None:
+            raise RuntimeError("Face analyzer is not initialized.")
 
         try:
             image_bgr = cv2.imread(str(image_path))

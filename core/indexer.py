@@ -6,9 +6,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import tempfile
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +27,7 @@ MOONDREAM_PROMPT = (
     "Describe this image concisely, focusing on main subjects, their actions, "
     "and the environment. Mention specific brands or landmarks if visible."
 )
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -58,26 +59,42 @@ class OllamaClient:
                 resolved_parallel = 1
         self.num_parallel = max(1, resolved_parallel)
         self._semaphore = asyncio.Semaphore(self.num_parallel)
+        self._client = httpx.AsyncClient(timeout=self.timeout)
+        self.max_retries = 3
 
     async def _post_generate(self, payload: dict[str, Any]) -> str:
         url = f"{self.base_url}/api/generate"
-        async with self._semaphore:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            async with self._semaphore:
                 try:
-                    response = await client.post(url, json=payload)
+                    response = await self._client.post(url, json=payload)
                     response.raise_for_status()
                 except httpx.HTTPError as exc:
-                    raise RuntimeError(f"Ollama request failed: {exc}") from exc
+                    last_exc = exc
+                    LOGGER.warning(
+                        "Ollama request failed (attempt %s/%s): %s",
+                        attempt,
+                        self.max_retries,
+                        exc,
+                    )
+                    if attempt == self.max_retries:
+                        raise RuntimeError(f"Ollama request failed after retries: {exc}") from exc
+                    await asyncio.sleep(min(2**attempt, 8))
+                    continue
 
-        try:
-            data = response.json()
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Ollama returned non-JSON response.") from exc
+            try:
+                data = response.json()
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Ollama returned non-JSON response.") from exc
 
-        text = data.get("response", "")
-        if not isinstance(text, str):
-            raise RuntimeError("Ollama response payload does not contain text field.")
-        return text.strip()
+            text = data.get("response", "")
+            if not isinstance(text, str):
+                raise RuntimeError("Ollama response payload does not contain text field.")
+            return text.strip()
+        if last_exc is not None:
+            raise RuntimeError(f"Ollama request failed: {last_exc}") from last_exc
+        raise RuntimeError("Ollama request failed with unknown error.")
 
     async def caption_image(
         self,
@@ -140,7 +157,7 @@ class MediaIndexer:
     async def index_directory(
         self,
         root_directory: str | Path,
-        keyframe_interval_sec: int = 3,
+        keyframe_interval_sec: int = 2,
         scene_delta_threshold: float = 15.0,
     ) -> dict[str, int]:
         """Recursively index all supported media files under root."""
@@ -176,6 +193,7 @@ class MediaIndexer:
     async def _index_image_file(self, image_path: Path) -> bool | None:
         file_hash = self._hash_file(image_path)
         if self.metadata_db.media_exists_by_hash(file_hash):
+            self.metadata_db.rebind_path_by_hash(file_hash=file_hash, new_path=str(image_path.resolve()))
             return None
 
         try:
@@ -183,9 +201,10 @@ class MediaIndexer:
             faces = self.inference_service.get_faces(image_path)
             caption = await self.ollama_client.caption_image(image_path)
         except Exception:
+            LOGGER.exception("Failed indexing image: %s", image_path)
             return False
 
-        media_id = self._build_media_id(image_path)
+        media_id = self._build_media_id(file_hash=file_hash, prefix="image")
         media = MediaFile(
             id=media_id,
             path=str(image_path.resolve()),
@@ -207,9 +226,10 @@ class MediaIndexer:
     ) -> bool | None:
         file_hash = self._hash_file(video_path)
         if self.metadata_db.media_exists_by_hash(file_hash):
+            self.metadata_db.rebind_path_by_hash(file_hash=file_hash, new_path=str(video_path.resolve()))
             return None
 
-        video_media_id = self._build_media_id(video_path, prefix="video")
+        video_media_id = self._build_media_id(file_hash=file_hash, prefix="video")
         try:
             with tempfile.TemporaryDirectory(prefix="vsa_keyframes_") as tmp_dir:
                 extracted_keyframes = self._extract_keyframes(
@@ -233,7 +253,10 @@ class MediaIndexer:
                 ]
 
                 for frame_idx, (frame_path, clip_vector) in enumerate(zip(frame_paths, clip_vectors)):
-                    frame_media_id = self._build_media_id(frame_path, prefix="frame")
+                    frame_media_id = self._build_media_id(
+                        file_hash=f"{file_hash}_{frame_idx}",
+                        prefix="frame",
+                    )
                     frame_timestamp = frame_timestamps[frame_idx]
                     faces = self.inference_service.get_faces(frame_path)
                     caption = await caption_tasks[frame_idx]
@@ -275,6 +298,7 @@ class MediaIndexer:
                     frame_captions
                 )
         except Exception:
+            LOGGER.exception("Failed indexing video: %s", video_path)
             return False
 
         media = MediaFile(
@@ -304,8 +328,8 @@ class MediaIndexer:
         return hasher.hexdigest()
 
     @staticmethod
-    def _build_media_id(path: Path, prefix: str = "media") -> str:
-        return f"{prefix}_{path.stem}_{uuid.uuid4().hex[:12]}"
+    def _build_media_id(file_hash: str, prefix: str = "media") -> str:
+        return f"{prefix}_{file_hash[:20]}"
 
     def _upsert_clip_embedding(
         self,
@@ -370,7 +394,7 @@ class MediaIndexer:
     def _extract_keyframes(
         video_path: Path,
         output_dir: Path,
-        interval_sec: int = 3,
+        interval_sec: int = 2,
         scene_delta_threshold: float = 15.0,
     ) -> list[ExtractedKeyframe]:
         """Extract keyframes every N seconds and on significant scene changes."""
