@@ -55,6 +55,9 @@ def render_result_card(result: dict[str, Any]) -> None:
             )
         )
         if isinstance(metadata, dict) and metadata:
+            ts = metadata.get("best_frame_timestamp_sec")
+            if isinstance(ts, (float, int)):
+                st.caption(f"Best match timestamp: {float(ts):.2f}s")
             st.json(metadata, expanded=False)
 
 
@@ -63,9 +66,9 @@ def render_search_tab() -> None:
     with st.sidebar:
         st.subheader("Search Settings")
         top_k = st.slider("Top-K results", min_value=1, max_value=100, value=20, step=1)
-        w_clip = st.slider("Weight: CLIP", 0.0, 1.0, 0.5, 0.05)
-        w_face = st.slider("Weight: Face", 0.0, 1.0, 0.4, 0.05)
-        w_fts = st.slider("Weight: FTS", 0.0, 1.0, 0.1, 0.05)
+        w_clip = st.slider("Weight: CLIP", 0.0, 1.0, 0.4, 0.05)
+        w_face = st.slider("Weight: Face", 0.0, 1.0, 0.6, 0.05)
+        w_fts = st.slider("Weight: FTS", 0.0, 1.0, 0.0, 0.05)
 
     weights = SearchWeights(clip=w_clip, face=w_face, fts=w_fts)
     engine = get_search_engine()

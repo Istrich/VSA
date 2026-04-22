@@ -47,6 +47,17 @@ class SQLiteMetadataDB:
                 CREATE INDEX IF NOT EXISTS idx_media_hash ON media(hash);
                 CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at);
 
+                CREATE TABLE IF NOT EXISTS video_keyframes (
+                    frame_media_id TEXT PRIMARY KEY,
+                    video_media_id TEXT NOT NULL,
+                    frame_index INTEGER NOT NULL,
+                    timestamp_sec REAL NOT NULL,
+                    frame_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_video_keyframes_video_media_id
+                    ON video_keyframes(video_media_id);
+
                 CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(
                     caption,
                     content='media',
@@ -137,6 +148,61 @@ class SQLiteMetadataDB:
                 paths,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def upsert_video_keyframe(
+        self,
+        frame_media_id: str,
+        video_media_id: str,
+        frame_index: int,
+        timestamp_sec: float,
+        frame_path: str,
+        created_at: str,
+    ) -> None:
+        """Insert or update one extracted keyframe linkage."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO video_keyframes (
+                    frame_media_id,
+                    video_media_id,
+                    frame_index,
+                    timestamp_sec,
+                    frame_path,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(frame_media_id) DO UPDATE SET
+                    video_media_id=excluded.video_media_id,
+                    frame_index=excluded.frame_index,
+                    timestamp_sec=excluded.timestamp_sec,
+                    frame_path=excluded.frame_path,
+                    created_at=excluded.created_at;
+                """,
+                (
+                    frame_media_id,
+                    video_media_id,
+                    frame_index,
+                    timestamp_sec,
+                    frame_path,
+                    created_at,
+                ),
+            )
+
+    def get_best_keyframe_timestamp(self, video_path: str) -> float | None:
+        """Return earliest keyframe timestamp for a video path."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(vk.timestamp_sec) AS timestamp_sec
+                FROM video_keyframes vk
+                JOIN media m ON m.id = vk.video_media_id
+                WHERE m.path = ?;
+                """,
+                (video_path,),
+            ).fetchone()
+        if row is None or row["timestamp_sec"] is None:
+            return None
+        return float(row["timestamp_sec"])
 
 
 class ChromaVectorStore:

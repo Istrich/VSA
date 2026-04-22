@@ -94,7 +94,11 @@ class HybridSearchEngine:
                 continue
             clip_sim = 1.0 / (1.0 + float(distance))
             entry = candidates.setdefault(path, self._new_candidate(path))
-            entry["clip_sim"] = max(entry["clip_sim"], clip_sim)
+            if clip_sim >= entry["clip_sim"]:
+                entry["clip_sim"] = clip_sim
+                timestamp = self._extract_timestamp_sec(metadata)
+                if timestamp is not None:
+                    entry["best_frame_timestamp_sec"] = timestamp
 
     def _merge_face_branch(
         self,
@@ -126,7 +130,11 @@ class HybridSearchEngine:
                 continue
             face_sim = 1.0 / (1.0 + float(distance))
             entry = candidates.setdefault(path, self._new_candidate(path))
-            entry["face_sim"] = max(entry["face_sim"], face_sim)
+            if face_sim >= entry["face_sim"]:
+                entry["face_sim"] = face_sim
+                timestamp = self._extract_timestamp_sec(metadata)
+                if timestamp is not None:
+                    entry["best_frame_timestamp_sec"] = timestamp
 
     def _merge_fts_branch(
         self,
@@ -176,18 +184,39 @@ class HybridSearchEngine:
             entry["caption"] = row.get("caption")
             entry["created_at"] = row.get("created_at")
             entry["metadata"] = parsed_metadata
+            best_timestamp = entry.get("best_frame_timestamp_sec")
+            if isinstance(best_timestamp, float):
+                entry["metadata"]["best_frame_timestamp_sec"] = best_timestamp
 
     @staticmethod
     def _compute_final_scores(
         candidates: dict[str, dict[str, Any]],
         weights: SearchWeights,
     ) -> None:
+        clip_values = [float(entry["clip_sim"]) for entry in candidates.values()]
+        face_values = [float(entry["face_sim"]) for entry in candidates.values()]
+
+        clip_min, clip_max = min(clip_values), max(clip_values)
+        face_min, face_max = min(face_values), max(face_values)
+
         for entry in candidates.values():
+            entry["clip_sim"] = HybridSearchEngine._min_max_scale(
+                float(entry["clip_sim"]), clip_min, clip_max
+            )
+            entry["face_sim"] = HybridSearchEngine._min_max_scale(
+                float(entry["face_sim"]), face_min, face_max
+            )
             entry["score"] = (
                 (weights.clip * entry["clip_sim"])
                 + (weights.face * entry["face_sim"])
                 + (weights.fts * entry["fts_score"])
             )
+
+    @staticmethod
+    def _min_max_scale(value: float, min_value: float, max_value: float) -> float:
+        if max_value == min_value:
+            return 1.0 if value > 0.0 else 0.0
+        return (value - min_value) / (max_value - min_value)
 
     @staticmethod
     def _new_candidate(path: str) -> dict[str, Any]:
@@ -201,6 +230,7 @@ class HybridSearchEngine:
             "caption": None,
             "created_at": None,
             "metadata": {},
+            "best_frame_timestamp_sec": None,
         }
 
     @staticmethod
@@ -210,6 +240,15 @@ class HybridSearchEngine:
         path = metadata.get("path")
         if isinstance(path, str) and path.strip():
             return path
+        return None
+
+    @staticmethod
+    def _extract_timestamp_sec(metadata: Any) -> float | None:
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("frame_timestamp_sec")
+        if isinstance(value, (float, int)):
+            return float(value)
         return None
 
     def search_with_uploaded_face(

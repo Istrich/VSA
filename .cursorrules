@@ -1,0 +1,1 @@
+Always use type hints and Pydantic models for data passing between modules.

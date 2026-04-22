@@ -6,8 +6,10 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,14 @@ MOONDREAM_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class ExtractedKeyframe:
+    """Keyframe file plus its source timestamp in seconds."""
+
+    path: Path
+    timestamp_sec: float
+
+
 class OllamaClient:
     """Async client for local Ollama API."""
 
@@ -34,18 +44,30 @@ class OllamaClient:
         self,
         base_url: str = "http://localhost:11434",
         timeout_seconds: float = 120.0,
+        num_parallel: int | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = httpx.Timeout(timeout_seconds)
+        env_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "1").strip()
+        if num_parallel is not None:
+            resolved_parallel = num_parallel
+        else:
+            try:
+                resolved_parallel = int(env_parallel or "1")
+            except ValueError:
+                resolved_parallel = 1
+        self.num_parallel = max(1, resolved_parallel)
+        self._semaphore = asyncio.Semaphore(self.num_parallel)
 
     async def _post_generate(self, payload: dict[str, Any]) -> str:
         url = f"{self.base_url}/api/generate"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"Ollama request failed: {exc}") from exc
+        async with self._semaphore:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                try:
+                    response = await client.post(url, json=payload)
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    raise RuntimeError(f"Ollama request failed: {exc}") from exc
 
         try:
             data = response.json()
@@ -187,30 +209,65 @@ class MediaIndexer:
         if self.metadata_db.media_exists_by_hash(file_hash):
             return None
 
+        video_media_id = self._build_media_id(video_path, prefix="video")
         try:
             with tempfile.TemporaryDirectory(prefix="vsa_keyframes_") as tmp_dir:
-                frame_paths = self._extract_keyframes(
+                extracted_keyframes = self._extract_keyframes(
                     video_path=video_path,
                     output_dir=Path(tmp_dir),
                     interval_sec=keyframe_interval_sec,
                     scene_delta_threshold=scene_delta_threshold,
                 )
-                if not frame_paths:
+                if not extracted_keyframes:
                     raise RuntimeError("No keyframes extracted from video.")
 
+                frame_paths = [item.path for item in extracted_keyframes]
+                frame_timestamps = [item.timestamp_sec for item in extracted_keyframes]
                 frame_captions: list[str] = []
                 face_count = 0
 
-                for frame_idx, frame_path in enumerate(frame_paths):
+                clip_vectors = self.inference_service.get_clip_embeddings(frame_paths, batch_size=16)
+                caption_tasks = [
+                    asyncio.create_task(self.ollama_client.caption_image(frame_path))
+                    for frame_path in frame_paths
+                ]
+
+                for frame_idx, (frame_path, clip_vector) in enumerate(zip(frame_paths, clip_vectors)):
                     frame_media_id = self._build_media_id(frame_path, prefix="frame")
-                    clip_vector = self.inference_service.get_clip_embedding(frame_path)
+                    frame_timestamp = frame_timestamps[frame_idx]
                     faces = self.inference_service.get_faces(frame_path)
-                    caption = await self.ollama_client.caption_image(frame_path)
+                    caption = await caption_tasks[frame_idx]
 
                     frame_captions.append(caption)
                     face_count += len(faces)
-                    self._upsert_clip_embedding(frame_media_id, clip_vector, str(video_path))
-                    self._upsert_face_embeddings(frame_media_id, faces, str(video_path))
+                    self._upsert_clip_embedding(
+                        media_id=frame_media_id,
+                        vector=clip_vector,
+                        path=str(video_path),
+                        extra_metadata={
+                            "frame_media_id": frame_media_id,
+                            "frame_index": frame_idx,
+                            "frame_timestamp_sec": frame_timestamp,
+                        },
+                    )
+                    self._upsert_face_embeddings(
+                        media_id=frame_media_id,
+                        faces=faces,
+                        path=str(video_path),
+                        extra_metadata={
+                            "frame_media_id": frame_media_id,
+                            "frame_index": frame_idx,
+                            "frame_timestamp_sec": frame_timestamp,
+                        },
+                    )
+                    self.metadata_db.upsert_video_keyframe(
+                        frame_media_id=frame_media_id,
+                        video_media_id=video_media_id,
+                        frame_index=frame_idx,
+                        timestamp_sec=frame_timestamp,
+                        frame_path=str(frame_path),
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
 
                     await asyncio.sleep(0)
 
@@ -220,9 +277,8 @@ class MediaIndexer:
         except Exception:
             return False
 
-        media_id = self._build_media_id(video_path, prefix="video")
         media = MediaFile(
-            id=media_id,
+            id=video_media_id,
             path=str(video_path.resolve()),
             hash=file_hash,
             caption=aggregated_caption,
@@ -256,14 +312,18 @@ class MediaIndexer:
         media_id: str,
         vector: list[float],
         path: str,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> None:
         if self.vector_store.clip_collection is None:
             raise RuntimeError("Chroma clip collection is not initialized.")
 
+        metadata = {"path": path}
+        if extra_metadata:
+            metadata.update(extra_metadata)
         self.vector_store.clip_collection.upsert(
             ids=[media_id],
             embeddings=[vector],
-            metadatas=[{"path": path}],
+            metadatas=[metadata],
         )
 
     def _upsert_face_embeddings(
@@ -271,6 +331,7 @@ class MediaIndexer:
         media_id: str,
         faces: list[dict[str, Any]],
         path: str,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> None:
         if self.vector_store.face_collection is None:
             raise RuntimeError("Chroma face collection is not initialized.")
@@ -295,6 +356,8 @@ class MediaIndexer:
                     "bbox": json.dumps(face.get("bbox", [])),
                 }
             )
+            if extra_metadata:
+                metadatas[-1].update(extra_metadata)
 
         if ids:
             self.vector_store.face_collection.upsert(
@@ -309,7 +372,7 @@ class MediaIndexer:
         output_dir: Path,
         interval_sec: int = 3,
         scene_delta_threshold: float = 15.0,
-    ) -> list[Path]:
+    ) -> list[ExtractedKeyframe]:
         """Extract keyframes every N seconds and on significant scene changes."""
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
@@ -321,7 +384,7 @@ class MediaIndexer:
         interval_frames = max(1, int(fps * max(1, interval_sec)))
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        frame_paths: list[Path] = []
+        frame_paths: list[ExtractedKeyframe] = []
 
         prev_gray: Any = None
         frame_index = 0
@@ -344,7 +407,10 @@ class MediaIndexer:
                 frame_file = output_dir / f"frame_{saved_index:06d}.jpg"
                 written = cv2.imwrite(str(frame_file), frame)
                 if written:
-                    frame_paths.append(frame_file)
+                    timestamp_sec = float(frame_index / fps)
+                    frame_paths.append(
+                        ExtractedKeyframe(path=frame_file, timestamp_sec=timestamp_sec)
+                    )
                     saved_index += 1
 
             prev_gray = gray

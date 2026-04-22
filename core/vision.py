@@ -114,19 +114,43 @@ class InferenceService:
 
     def get_clip_embedding(self, image_path: str | Path) -> list[float]:
         """Return normalized CLIP embedding vector for an image."""
-        image_path = Path(image_path)
-        if not image_path.exists():
-            raise FileNotFoundError(f"Image not found: {image_path}")
+        vectors = self.get_clip_embeddings([image_path], batch_size=1)
+        return vectors[0]
 
+    def get_clip_embeddings(
+        self,
+        image_paths: list[str | Path],
+        batch_size: int = 16,
+    ) -> list[list[float]]:
+        """Return normalized CLIP embedding vectors for a batch of images."""
+        if not image_paths:
+            return []
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+
+        normalized_paths = [Path(path) for path in image_paths]
+        for image_path in normalized_paths:
+            if not image_path.exists():
+                raise FileNotFoundError(f"Image not found: {image_path}")
+
+        all_vectors: list[list[float]] = []
         try:
-            image = Image.open(image_path).convert("RGB")
-            image_tensor = self.clip_preprocess(image).unsqueeze(0).to(self.device)
             with torch.inference_mode():
-                features = self.clip_model.encode_image(image_tensor)
-                features = features / features.norm(dim=-1, keepdim=True)
-            return features.squeeze(0).detach().cpu().tolist()
+                for idx in range(0, len(normalized_paths), batch_size):
+                    batch_paths = normalized_paths[idx : idx + batch_size]
+                    tensors: list[torch.Tensor] = []
+                    for image_path in batch_paths:
+                        image = Image.open(image_path).convert("RGB")
+                        tensors.append(self.clip_preprocess(image))
+
+                    batch_tensor = torch.stack(tensors, dim=0).to(self.device)
+                    features = self.clip_model.encode_image(batch_tensor)
+                    features = features / features.norm(dim=-1, keepdim=True)
+                    all_vectors.extend(features.detach().cpu().tolist())
+            return all_vectors
         except Exception as exc:
-            raise RuntimeError(f"Failed to compute CLIP embedding for {image_path}.") from exc
+            raise RuntimeError("Failed to compute CLIP embeddings batch.") from exc
         finally:
             self._cleanup_vram()
 
