@@ -1,4 +1,13 @@
-"""Data models and model asset status for Vision Semantic Archive."""
+"""Pydantic data models and model-asset registry for Vision Semantic Archive.
+
+All cross-module data now travels through pydantic models per `.cursorrules`:
+
+- ``MediaFile`` — SQLite row projection for media entities
+- ``Face`` — detected face descriptor
+- ``SearchQuery``/``SearchWeights``/``SearchResult`` — public search API
+- ``IndexingStats`` — return type of ``MediaIndexer.index_directory``
+- ``ModelSpec``/``ModelRegistry`` — on-disk asset registry (service, not data)
+"""
 
 from __future__ import annotations
 
@@ -7,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ProcessingStatus(str, Enum):
@@ -36,10 +45,16 @@ class Face(BaseModel):
 
     id: str
     media_id: str
-    bbox: list[float] = Field(
-        description="Face bounding box in XYXY format: [x1, y1, x2, y2]."
-    )
+    bbox: list[float] = Field(description="Face bounding box in XYXY format: [x1, y1, x2, y2].")
     embedding_id: str
+
+
+class SearchWeights(BaseModel):
+    """Normalized hybrid scoring weights."""
+
+    clip: float = Field(default=0.5, ge=0.0, le=1.0)
+    face: float = Field(default=0.4, ge=0.0, le=1.0)
+    fts: float = Field(default=0.1, ge=0.0, le=1.0)
 
 
 class SearchQuery(BaseModel):
@@ -47,28 +62,18 @@ class SearchQuery(BaseModel):
 
     text: str | None = None
     face_reference_path: str | None = None
-    top_k: int = 20
-    weights: dict[str, float] = Field(
-        default_factory=lambda: {"clip": 0.5, "face": 0.4, "fts": 0.1}
-    )
-
-
-class SearchWeights(BaseModel):
-    """Normalized hybrid scoring weights."""
-
-    clip: float = 0.5
-    face: float = 0.4
-    fts: float = 0.1
+    top_k: int = Field(default=20, ge=1, le=500)
+    weights: SearchWeights = Field(default_factory=SearchWeights)
 
 
 class SearchResult(BaseModel):
-    """Search API result payload."""
+    """Search API result payload returned by ``HybridSearchEngine.search``."""
 
     path: str
     score: float
-    clip_sim: float
-    face_sim: float
-    fts_score: float
+    clip_sim: float = 0.0
+    face_sim: float = 0.0
+    fts_score: float = 0.0
     id: str | None = None
     caption: str | None = None
     created_at: str | None = None
@@ -76,34 +81,74 @@ class SearchResult(BaseModel):
     best_frame_timestamp_sec: float | None = None
 
 
+class IndexingStats(BaseModel):
+    """Aggregate counters produced by ``MediaIndexer.index_directory``."""
+
+    indexed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    total_candidates: int = 0
+
+
 class ModelSpec(BaseModel):
     """Single model artifact expected on disk."""
 
     name: str
-    relative_path: str
+    relative_path: str = Field(
+        description=(
+            "File whose presence declares the pack ready. Path is relative to "
+            "the registry root (defaults to Settings.models_dir)."
+        )
+    )
     download_url: str
-    sha256: str | None = None
+    sha256: str | None = Field(
+        default=None,
+        description="Optional digest of the downloaded artifact (zip or file).",
+    )
+    archive_sha256: str | None = Field(
+        default=None,
+        description=(
+            "Optional sha256 of the raw downloaded archive *before* extraction. "
+            "Populated for zipped packs such as buffalo_l."
+        ),
+    )
+    required: bool = True
+
+    @field_validator("relative_path")
+    @classmethod
+    def _no_absolute_paths(cls, value: str) -> str:
+        if Path(value).is_absolute():
+            raise ValueError("relative_path must be relative to the registry root")
+        return value
 
 
 class ModelRegistry:
-    """Checks whether required model files are present."""
+    """Checks whether required model files are present.
 
-    def __init__(self, root: str | Path = "./models") -> None:
+    The registry now reflects what the code actually loads:
+
+    - CLIP weights are fetched by ``open_clip`` itself (from the HuggingFace
+      hub via the ``hf-hub:...`` spec). We do not ship a local safetensors
+      copy any more — the orphaned asset from the previous revision was the
+      source of BUG-N06/N25.
+    - InsightFace expects ``<root>/models/<name>/...``. The ``buffalo_l``
+      pack is downloaded as a zip and extracted into
+      ``<insightface_home>/models/buffalo_l/`` which matches
+      ``FaceAnalysis(name="buffalo_l", root=insightface_home)``.
+    """
+
+    def __init__(self, root: str | Path = "./models/insightface_home") -> None:
         self.root = Path(root)
         self.required_models: tuple[ModelSpec, ...] = (
             ModelSpec(
-                name="clip_vit_l_14",
-                relative_path="vision/open_clip_vit_l_14/model.safetensors",
-                download_url=(
-                    "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/model.safetensors"
-                ),
-            ),
-            ModelSpec(
                 name="insightface_buffalo_l",
-                relative_path="faces/buffalo_l/w600k_r50.onnx",
+                relative_path="models/buffalo_l/w600k_r50.onnx",
                 download_url=(
-                    "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+                    "https://github.com/deepinsight/insightface/releases/"
+                    "download/v0.7/buffalo_l.zip"
                 ),
+                archive_sha256=None,
+                sha256=None,
             ),
         )
 
@@ -116,10 +161,9 @@ class ModelRegistry:
         return result
 
     def is_ready(self) -> bool:
-        """Return True when all required models are found on disk."""
+        """Return True when all required model files are present on disk."""
         return all(status == "FOUND" for status in self.get_model_status().values())
 
     def get_specs(self) -> tuple[ModelSpec, ...]:
         """Return immutable model specs registry."""
         return self.required_models
-

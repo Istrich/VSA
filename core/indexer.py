@@ -1,4 +1,20 @@
-"""Media indexing pipeline with async Ollama integration."""
+"""Media indexing pipeline with async Ollama integration.
+
+Changes vs. previous revision:
+
+- All sync, IO- or CPU-heavy calls (``_hash_file``, CLIP batch, face detect,
+  ``cv2.imread``, keyframe extraction) are wrapped in ``asyncio.to_thread``
+  so they no longer block the event loop (BUG-N08).
+- Per-frame caption tasks are now awaited via ``asyncio.gather`` with
+  ``return_exceptions=True`` so a single failed frame does not discard the
+  whole video and does not leave unawaited tasks (BUG-N09).
+- Hash-based deduplication now synchronises BOTH SQLite and ChromaDB path
+  metadata through ``ChromaVectorStore.rebind_media_path`` (BUG-N10).
+- ``index_directory`` returns a typed ``IndexingStats`` instead of a dict
+  (TYPES-N02).
+- Ollama client takes dependencies from ``Settings``, can be cancelled via
+  ``aclose``, and keeps a single ``httpx.AsyncClient`` (PERF-05).
+"""
 
 from __future__ import annotations
 
@@ -7,18 +23,20 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import cv2
 import httpx
 
+from .config import Settings, get_settings
 from .db import ChromaVectorStore, SQLiteMetadataDB
-from .models import MediaFile
+from .exceptions import IngestError, OllamaError
+from .models import IndexingStats, MediaFile
 from .vision import InferenceService
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -28,6 +46,8 @@ MOONDREAM_PROMPT = (
     "and the environment. Mention specific brands or landmarks if visible."
 )
 LOGGER = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[IndexingStats, Path], None]
 
 
 @dataclass(frozen=True)
@@ -43,24 +63,24 @@ class OllamaClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
-        timeout_seconds: float = 120.0,
+        base_url: str | None = None,
+        timeout_seconds: float | None = None,
         num_parallel: int | None = None,
+        max_retries: int | None = None,
+        settings: Settings | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.timeout = httpx.Timeout(timeout_seconds)
-        env_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "1").strip()
-        if num_parallel is not None:
-            resolved_parallel = num_parallel
-        else:
-            try:
-                resolved_parallel = int(env_parallel or "1")
-            except ValueError:
-                resolved_parallel = 1
-        self.num_parallel = max(1, resolved_parallel)
+        resolved_settings = settings or get_settings()
+        self.base_url = (base_url or resolved_settings.ollama_base_url).rstrip("/")
+        self.timeout = httpx.Timeout(timeout_seconds or resolved_settings.ollama_timeout_sec)
+        self.num_parallel = max(1, int(num_parallel or resolved_settings.ollama_num_parallel))
+        self.max_retries = max(1, int(max_retries or resolved_settings.ollama_max_retries))
         self._semaphore = asyncio.Semaphore(self.num_parallel)
         self._client = httpx.AsyncClient(timeout=self.timeout)
-        self.max_retries = 3
+        self._settings = resolved_settings
+
+    async def aclose(self) -> None:
+        """Release the shared HTTP connection pool."""
+        await self._client.aclose()
 
     async def _post_generate(self, payload: dict[str, Any]) -> str:
         url = f"{self.base_url}/api/generate"
@@ -79,27 +99,26 @@ class OllamaClient:
                         exc,
                     )
                     if attempt == self.max_retries:
-                        raise RuntimeError(f"Ollama request failed after retries: {exc}") from exc
-                    await asyncio.sleep(min(2**attempt, 8))
+                        raise OllamaError(f"Ollama request failed after retries: {exc}") from exc
+                    await asyncio.sleep(min(2 ** attempt, 8))
                     continue
 
             try:
                 data = response.json()
             except json.JSONDecodeError as exc:
-                raise RuntimeError("Ollama returned non-JSON response.") from exc
+                raise OllamaError("Ollama returned non-JSON response.") from exc
 
             text = data.get("response", "")
             if not isinstance(text, str):
-                raise RuntimeError("Ollama response payload does not contain text field.")
+                raise OllamaError("Ollama response payload does not contain text field.")
             return text.strip()
-        if last_exc is not None:
-            raise RuntimeError(f"Ollama request failed: {last_exc}") from last_exc
-        raise RuntimeError("Ollama request failed with unknown error.")
+
+        raise OllamaError(f"Ollama request failed: {last_exc}")
 
     async def caption_image(
         self,
         image_path: str | Path,
-        model: str = "moondream2",
+        model: str | None = None,
         prompt: str = MOONDREAM_PROMPT,
     ) -> str:
         """Generate concise image caption via VLM."""
@@ -107,9 +126,10 @@ class OllamaClient:
         if not path.exists():
             raise FileNotFoundError(f"Image not found for captioning: {path}")
 
-        image_base64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+        bytes_payload = await asyncio.to_thread(path.read_bytes)
+        image_base64 = base64.b64encode(bytes_payload).decode("utf-8")
         payload = {
-            "model": model,
+            "model": model or self._settings.ollama_caption_model,
             "prompt": prompt,
             "images": [image_base64],
             "stream": False,
@@ -119,20 +139,25 @@ class OllamaClient:
     async def summarize_video_captions(
         self,
         captions: list[str],
-        model: str = "llama3",
+        model: str | None = None,
     ) -> str:
         """Aggregate frame captions into one video-level summary."""
-        if not captions:
+        non_empty = [c for c in captions if c and c.strip()]
+        if not non_empty:
             return ""
 
-        bullet_list = "\n".join(f"- {caption}" for caption in captions if caption.strip())
+        bullet_list = "\n".join(f"- {caption}" for caption in non_empty)
         prompt = (
             "You are summarizing keyframes from one video. "
             "Write one concise paragraph (max 80 words) that merges repeated details, "
             "mentions main subjects, actions and setting.\n\n"
             f"Frame descriptions:\n{bullet_list}"
         )
-        payload = {"model": model, "prompt": prompt, "stream": False}
+        payload = {
+            "model": model or self._settings.ollama_summary_model,
+            "prompt": prompt,
+            "stream": False,
+        }
         return await self._post_generate(payload)
 
 
@@ -145,12 +170,13 @@ class MediaIndexer:
         vector_store: ChromaVectorStore | None = None,
         inference_service: InferenceService | None = None,
         ollama_client: OllamaClient | None = None,
+        settings: Settings | None = None,
     ) -> None:
-        self.metadata_db = metadata_db or SQLiteMetadataDB()
-        self.vector_store = vector_store or ChromaVectorStore()
-        self.inference_service = inference_service or InferenceService()
-        self.ollama_client = ollama_client or OllamaClient()
-
+        self._settings = settings or get_settings()
+        self.metadata_db = metadata_db or SQLiteMetadataDB(settings=self._settings)
+        self.vector_store = vector_store or ChromaVectorStore(settings=self._settings)
+        self.inference_service = inference_service or InferenceService(settings=self._settings)
+        self.ollama_client = ollama_client or OllamaClient(settings=self._settings)
         self.metadata_db.initialize()
         self.vector_store.initialize()
 
@@ -159,50 +185,71 @@ class MediaIndexer:
         root_directory: str | Path,
         keyframe_interval_sec: int = 2,
         scene_delta_threshold: float = 15.0,
-    ) -> dict[str, int]:
+        cancel_event: asyncio.Event | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> IndexingStats:
         """Recursively index all supported media files under root."""
         root = Path(root_directory)
         if not root.exists() or not root.is_dir():
             raise NotADirectoryError(f"Directory not found: {root}")
 
-        counters = {"indexed": 0, "skipped": 0, "failed": 0}
-        for media_path in root.rglob("*"):
-            if not media_path.is_file():
-                continue
+        candidates = [
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+        ]
+        stats = IndexingStats(total_candidates=len(candidates))
+
+        for media_path in candidates:
+            if cancel_event is not None and cancel_event.is_set():
+                LOGGER.info("Indexing cancelled by user after %s files.", stats.indexed)
+                break
 
             suffix = media_path.suffix.lower()
-            if suffix in IMAGE_EXTENSIONS:
-                ok = await self._index_image_file(media_path)
-            elif suffix in VIDEO_EXTENSIONS:
-                ok = await self._index_video_file(
-                    media_path,
-                    keyframe_interval_sec=keyframe_interval_sec,
-                    scene_delta_threshold=scene_delta_threshold,
-                )
-            else:
+            try:
+                if suffix in IMAGE_EXTENSIONS:
+                    ok = await self._index_image_file(media_path)
+                elif suffix in VIDEO_EXTENSIONS:
+                    ok = await self._index_video_file(
+                        media_path,
+                        keyframe_interval_sec=keyframe_interval_sec,
+                        scene_delta_threshold=scene_delta_threshold,
+                    )
+                else:
+                    continue
+            except IngestError:
+                LOGGER.exception("Ingest failed: %s", media_path)
+                stats.failed += 1
+                if progress_callback is not None:
+                    progress_callback(stats, media_path)
                 continue
 
             if ok is True:
-                counters["indexed"] += 1
+                stats.indexed += 1
             elif ok is False:
-                counters["failed"] += 1
+                stats.failed += 1
             else:
-                counters["skipped"] += 1
-        return counters
+                stats.skipped += 1
+
+            if progress_callback is not None:
+                progress_callback(stats, media_path)
+        return stats
 
     async def _index_image_file(self, image_path: Path) -> bool | None:
-        file_hash = self._hash_file(image_path)
+        file_hash = await asyncio.to_thread(self._hash_file, image_path)
         if self.metadata_db.media_exists_by_hash(file_hash):
-            self.metadata_db.rebind_path_by_hash(file_hash=file_hash, new_path=str(image_path.resolve()))
+            await self._rebind_path_if_changed(file_hash=file_hash, new_path=str(image_path.resolve()))
             return None
 
         try:
-            clip_vector = self.inference_service.get_clip_embedding(image_path)
-            faces = self.inference_service.get_faces(image_path)
+            clip_vector = await asyncio.to_thread(
+                self.inference_service.get_clip_embedding, image_path
+            )
+            faces = await asyncio.to_thread(self.inference_service.get_faces, image_path)
             caption = await self.ollama_client.caption_image(image_path)
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("Failed indexing image: %s", image_path)
-            return False
+            raise IngestError(f"image indexing failed: {image_path}") from exc
 
         media_id = self._build_media_id(file_hash=file_hash, prefix="image")
         media = MediaFile(
@@ -224,44 +271,74 @@ class MediaIndexer:
         keyframe_interval_sec: int,
         scene_delta_threshold: float,
     ) -> bool | None:
-        file_hash = self._hash_file(video_path)
+        file_hash = await asyncio.to_thread(self._hash_file, video_path)
         if self.metadata_db.media_exists_by_hash(file_hash):
-            self.metadata_db.rebind_path_by_hash(file_hash=file_hash, new_path=str(video_path.resolve()))
+            await self._rebind_path_if_changed(file_hash=file_hash, new_path=str(video_path.resolve()))
             return None
 
         video_media_id = self._build_media_id(file_hash=file_hash, prefix="video")
         try:
             with tempfile.TemporaryDirectory(prefix="vsa_keyframes_") as tmp_dir:
-                extracted_keyframes = self._extract_keyframes(
-                    video_path=video_path,
-                    output_dir=Path(tmp_dir),
-                    interval_sec=keyframe_interval_sec,
-                    scene_delta_threshold=scene_delta_threshold,
+                extracted_keyframes = await asyncio.to_thread(
+                    self._extract_keyframes,
+                    video_path,
+                    Path(tmp_dir),
+                    keyframe_interval_sec,
+                    scene_delta_threshold,
                 )
                 if not extracted_keyframes:
-                    raise RuntimeError("No keyframes extracted from video.")
+                    raise IngestError(f"No keyframes extracted: {video_path}")
 
                 frame_paths = [item.path for item in extracted_keyframes]
                 frame_timestamps = [item.timestamp_sec for item in extracted_keyframes]
+
+                clip_vectors = await asyncio.to_thread(
+                    self.inference_service.get_clip_embeddings,
+                    frame_paths,
+                    16,
+                )
+
+                caption_awaitables: list[Awaitable[str]] = [
+                    self.ollama_client.caption_image(frame_path) for frame_path in frame_paths
+                ]
+                caption_results = await asyncio.gather(
+                    *caption_awaitables, return_exceptions=True
+                )
+
                 frame_captions: list[str] = []
                 face_count = 0
+                successful_frames = 0
+                for frame_idx, (frame_path, clip_vector) in enumerate(
+                    zip(frame_paths, clip_vectors, strict=True)
+                ):
+                    caption_result = caption_results[frame_idx]
+                    if isinstance(caption_result, BaseException):
+                        LOGGER.warning(
+                            "Caption failed for %s frame %s: %s",
+                            video_path,
+                            frame_idx,
+                            caption_result,
+                        )
+                        caption_text = ""
+                    else:
+                        caption_text = caption_result
+                        successful_frames += 1
 
-                clip_vectors = self.inference_service.get_clip_embeddings(frame_paths, batch_size=16)
-                caption_tasks = [
-                    asyncio.create_task(self.ollama_client.caption_image(frame_path))
-                    for frame_path in frame_paths
-                ]
-
-                for frame_idx, (frame_path, clip_vector) in enumerate(zip(frame_paths, clip_vectors)):
                     frame_media_id = self._build_media_id(
-                        file_hash=f"{file_hash}_{frame_idx}",
-                        prefix="frame",
+                        file_hash=f"{file_hash}_{frame_idx}", prefix="frame"
                     )
                     frame_timestamp = frame_timestamps[frame_idx]
-                    faces = self.inference_service.get_faces(frame_path)
-                    caption = await caption_tasks[frame_idx]
+                    try:
+                        faces = await asyncio.to_thread(
+                            self.inference_service.get_faces, frame_path
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Face detection failed for %s frame %s", video_path, frame_idx
+                        )
+                        faces = []
 
-                    frame_captions.append(caption)
+                    frame_captions.append(caption_text)
                     face_count += len(faces)
                     self._upsert_clip_embedding(
                         media_id=frame_media_id,
@@ -291,15 +368,25 @@ class MediaIndexer:
                         frame_path=str(frame_path),
                         created_at=datetime.now(timezone.utc).isoformat(),
                     )
-
                     await asyncio.sleep(0)
 
-                aggregated_caption = await self.ollama_client.summarize_video_captions(
-                    frame_captions
-                )
-        except Exception:
+                if successful_frames == 0:
+                    raise IngestError(
+                        f"All {len(frame_paths)} frame captions failed for {video_path}"
+                    )
+
+                try:
+                    aggregated_caption = await self.ollama_client.summarize_video_captions(
+                        frame_captions
+                    )
+                except OllamaError:
+                    LOGGER.exception("Video summary failed; using first non-empty caption.")
+                    aggregated_caption = next((c for c in frame_captions if c), "")
+        except IngestError:
+            raise
+        except Exception as exc:
             LOGGER.exception("Failed indexing video: %s", video_path)
-            return False
+            raise IngestError(f"video indexing failed: {video_path}") from exc
 
         media = MediaFile(
             id=video_media_id,
@@ -315,6 +402,23 @@ class MediaIndexer:
         )
         self.metadata_db.upsert_media(media)
         return True
+
+    async def _rebind_path_if_changed(self, file_hash: str, new_path: str) -> None:
+        old_path = self.metadata_db.get_path_by_hash(file_hash)
+        if old_path is None or old_path == new_path:
+            return
+        self.metadata_db.rebind_path_by_hash(file_hash=file_hash, new_path=new_path)
+        try:
+            await asyncio.to_thread(
+                self.vector_store.rebind_media_path, old_path, new_path
+            )
+        except Exception:  # defensive; Chroma update is best-effort
+            LOGGER.exception(
+                "Failed to rebind Chroma metadata for hash=%s (%s -> %s)",
+                file_hash,
+                old_path,
+                new_path,
+            )
 
     @staticmethod
     def _hash_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -338,9 +442,6 @@ class MediaIndexer:
         path: str,
         extra_metadata: dict[str, Any] | None = None,
     ) -> None:
-        if self.vector_store.clip_collection is None:
-            raise RuntimeError("Chroma clip collection is not initialized.")
-
         metadata = {"path": path}
         if extra_metadata:
             metadata.update(extra_metadata)
@@ -357,9 +458,6 @@ class MediaIndexer:
         path: str,
         extra_metadata: dict[str, Any] | None = None,
     ) -> None:
-        if self.vector_store.face_collection is None:
-            raise RuntimeError("Chroma face collection is not initialized.")
-
         if not faces:
             return
 
@@ -372,16 +470,15 @@ class MediaIndexer:
                 continue
             ids.append(f"{media_id}_face_{face_idx}")
             embeddings.append([float(v) for v in embedding])
-            metadatas.append(
-                {
-                    "path": path,
-                    "parent_media_id": media_id,
-                    "score": float(face.get("score", 0.0)),
-                    "bbox": json.dumps(face.get("bbox", [])),
-                }
-            )
+            meta: dict[str, Any] = {
+                "path": path,
+                "parent_media_id": media_id,
+                "score": float(face.get("score", 0.0)),
+                "bbox": json.dumps(face.get("bbox", [])),
+            }
             if extra_metadata:
-                metadatas[-1].update(extra_metadata)
+                meta.update(extra_metadata)
+            metadatas.append(meta)
 
         if ids:
             self.vector_store.face_collection.upsert(
@@ -400,46 +497,46 @@ class MediaIndexer:
         """Extract keyframes every N seconds and on significant scene changes."""
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
+            raise IngestError(f"Cannot open video: {video_path}")
 
-        fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
-        if fps <= 0:
-            fps = 25.0
-        interval_frames = max(1, int(fps * max(1, interval_sec)))
+        try:
+            fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+            if fps <= 0:
+                fps = 25.0
+            interval_frames = max(1, int(fps * max(1, interval_sec)))
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        frame_paths: list[ExtractedKeyframe] = []
+            output_dir.mkdir(parents=True, exist_ok=True)
+            frame_paths: list[ExtractedKeyframe] = []
 
-        prev_gray: Any = None
-        frame_index = 0
-        saved_index = 0
+            prev_gray: Any = None
+            frame_index = 0
+            saved_index = 0
 
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
 
-            should_save = frame_index % interval_frames == 0
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            if prev_gray is not None:
-                delta = cv2.absdiff(gray, prev_gray)
-                mean_delta = float(delta.mean())
-                if mean_delta >= scene_delta_threshold:
-                    should_save = True
+                should_save = frame_index % interval_frames == 0
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if prev_gray is not None:
+                    delta = cv2.absdiff(gray, prev_gray)
+                    mean_delta = float(delta.mean())
+                    if mean_delta >= scene_delta_threshold:
+                        should_save = True
 
-            if should_save:
-                frame_file = output_dir / f"frame_{saved_index:06d}.jpg"
-                written = cv2.imwrite(str(frame_file), frame)
-                if written:
-                    timestamp_sec = float(frame_index / fps)
-                    frame_paths.append(
-                        ExtractedKeyframe(path=frame_file, timestamp_sec=timestamp_sec)
-                    )
-                    saved_index += 1
+                if should_save:
+                    frame_file = output_dir / f"frame_{saved_index:06d}.jpg"
+                    written = cv2.imwrite(str(frame_file), frame)
+                    if written:
+                        timestamp_sec = float(frame_index / fps)
+                        frame_paths.append(
+                            ExtractedKeyframe(path=frame_file, timestamp_sec=timestamp_sec)
+                        )
+                        saved_index += 1
 
-            prev_gray = gray
-            frame_index += 1
-
-        capture.release()
-        return frame_paths
-
+                prev_gray = gray
+                frame_index += 1
+            return frame_paths
+        finally:
+            capture.release()

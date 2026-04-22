@@ -1,5 +1,10 @@
 # Архитектура сервиса: Vision Semantic Archive (VSA)
 
+> Документ синхронизирован с кодовой базой 2026-04-22 после правок v2
+> (`docs/plans/2026-04-22-audit-v2-fixes.md`). Расхождения с реализацией,
+> которые были отмечены в прошлом аудите (NLP parser, reranker формула,
+> keyframe interval), устранены или явно переведены в future work.
+
 ## Роли агентов (System Prompts)
 
 Вынесены в отдельные файлы:
@@ -11,57 +16,79 @@
 
 ## 1. Технологический стек и версии
 
-- **Язык:** Python 3.11+
-- **UI/Frontend:** Streamlit 1.32+ (максимальная скорость сборки интерфейса)
-- **Vector DB:** ChromaDB 0.4.x (локальное хранилище, не требует Docker)
-- **Metadata/FTS:** SQLite 3.x (с поддержкой FTS5 для полнотекстового поиска)
-- **Deep Learning Framework:** PyTorch 2.2+ (CUDA 12.1)
+- **Язык:** Python 3.11 или 3.12 (3.14 не поддерживается из-за текущей
+  совместимости onnxruntime-gpu).
+- **UI:** Streamlit 1.32+.
+- **Vector DB:** ChromaDB 0.4.24+ (локальный `PersistentClient`).
+- **Metadata/FTS:** SQLite FTS5 (из стандартной поставки).
+- **DL Framework:** PyTorch 2.2+ (CUDA 12.1 на проде, CPU fallback в dev).
 
 ### Inference Engines
 
-- **Faces:** InsightFace (модель `buffalo_l`) через `onnxruntime-gpu`
-- **Semantic (CLIP):** `open_clip_torch` (модель `ViT-L-14 / openai`)
-- **VLM/LLM:** Ollama API (модели `moondream2` для описаний и `llama3` для парсинга запросов)
+- **Faces:** InsightFace `buffalo_l` через `onnxruntime-gpu` (CUDA) или CPU.
+- **Semantic (CLIP):** `open_clip_torch` с `hf-hub:openai/clip-vit-large-patch14`.
+  Веса скачиваются самим `open_clip`; локальные safetensors больше не
+  хранятся и не качаются (см. `docs/plans/2026-04-22-audit-v2-fixes.md`,
+  §3.5).
+- **VLM/LLM:** Ollama API (`moondream2` → описания кадра, `llama3` →
+  агрегация видео-описаний). NLP-парсер запросов планируется в будущей
+  итерации (future work, см. §7).
 
 ## 2. Компоненты системы
 
-### Модуль A: Ingestion Pipeline (фоновая индексация)
+### Модуль A: Ingestion Pipeline (`core/indexer.py`)
 
-- **Scanner:** рекурсивный обход директорий, хеширование файлов (`SHA-256`) для предотвращения дублей
-- **Vision Worker (мультипоточность):**
-  - **Stage 1 (Faces):** извлечение эмбеддингов лиц (512-d вектор)
-  - **Stage 2 (CLIP):** извлечение семантического вектора кадра (768-d вектор)
-  - **Stage 3 (VLM):** запрос к Ollama (`moondream2`) для генерации короткого текстового описания (caption)
-- **Video Handler:** нарезка видео через FFmpeg (1 кадр в 2 сек) -> обработка кадров как фото -> агрегация описаний через LLM
+- **Scanner:** рекурсивный обход директорий, SHA-256 хеш файла для дедупа
+  и rebind путей.
+- **Vision Worker:** CLIP-эмбеддинг кадра + InsightFace-эмбеддинги лиц.
+  Все sync-вызовы выполняются через `asyncio.to_thread` чтобы не блокировать
+  event-loop (BUG-N08).
+- **VLM:** `OllamaClient` с ретраями, экспоненциальным backoff и единым
+  долгоживущим `httpx.AsyncClient`.
+- **Video Handler:** кэйфреймы через OpenCV (интервал + scene-delta). На
+  уровне ingestion кадры выдаются батчем в CLIP и параллельно в Ollama; для
+  стыковки используется `asyncio.gather(..., return_exceptions=True)` —
+  отдельный сбой одного кадра больше не «роняет» всё видео (BUG-N09).
 
-### Модуль B: Storage Layer (гибридная БД)
+### Модуль B: Storage Layer (`core/db.py`)
 
-#### ChromaDB Collections
+#### ChromaDB Collections (`embeddings_clip`, `embeddings_faces`)
 
-- `collection_clip`: `{id: file_path, vector: clip_emb, metadata: {type: image/video}}`
-- `collection_faces`: `{id: face_id, vector: face_emb, metadata: {file_id: path}}`
+- `embeddings_clip`: `{id: media_id or frame_media_id, vector: clip_emb, metadata: {path, type, frame_media_id?, frame_index?, frame_timestamp_sec?}}`
+- `embeddings_faces`: `{id: face_id, vector: face_emb, metadata: {path, parent_media_id, score, bbox, frame_* }}`
 
-#### SQLite (FTS5)
+Схема коллекций не меняется без плана миграции (guardrail).
 
-- Таблица `media`: `file_path`, `caption_text`, `created_at`, `is_video`
+#### SQLite (`metadata.db`)
 
-### Модуль C: Search Engine (интеллектуальный поиск)
+- `media(id, path UNIQUE, hash UNIQUE, caption, created_at, metadata_json)` с
+  FTS5-зеркалом `media_fts` (триггеры INSERT/UPDATE/DELETE).
+- `video_keyframes(frame_media_id, video_media_id, frame_index, timestamp_sec, frame_path, created_at)`.
+- `schema_version(version)` — служит плейсхолдером для будущих миграций.
+- Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`.
+  Соединение — thread-local, переиспользуется (BUG-N13).
 
-- **NLP Parser:** преобразует запрос пользователя через Ollama (`llama3`) в JSON-структуру:
+### Модуль C: Search Engine (`core/search.py`)
 
-```json
-{
-  "search_type": "hybrid",
-  "person_ref": true,
-  "text_description": "big tree near water",
-  "location": "Japan"
-}
-```
+- Вход: `SearchQuery` (pydantic). Результат: `list[SearchResult]`.
+- Три ветви: CLIP (семантический вектор), Faces (по референс-лицу), FTS
+  (BM25 по captions). Каждая ветвь **сначала** нормализует свои значения
+  через min-max, и только потом мёржится в общий пул кандидатов, чтобы
+  отсутствующие ветви не искажали итоговый скор (BUG-N17/N18).
+- Финальный score = взвешенная сумма (`w_clip * clip + w_face * face +
+  w_fts * fts`), веса — `SearchWeights`. Формула осознанно простая; более
+  сложные rerank'ы (косинус + BM25 с оригинальным абсолютным шкалированием)
+  отложены до появления тестов качества ранжирования.
+- Опциональный NLP parser запросов через Ollama `llama3` — future work, не
+  реализован в текущей итерации.
 
-- **Hybrid Retriever:**
-  - если `person_ref = true`: сначала поиск по `collection_faces`
-  - параллельно: семантический поиск по `collection_clip` + полнотекстовый поиск по SQLite (FTS5)
-- **Reranker:** сортировка результатов по совокупному весу (Cosine Similarity + BM25 Score)
+### Модуль D: Orchestration (`core/container.py`)
+
+`ServiceContainer` — единая точка построения долгоживущих сервисов
+(`SQLiteMetadataDB`, `ChromaVectorStore`, `InferenceService`, `OllamaClient`)
+в рамках процесса. Предотвращает создание второго
+`chromadb.PersistentClient` на тот же каталог (BUG-N01). UI и
+compatibility-чеки получают готовые сервисы через контейнер.
 
 ## 3. Схема взаимодействия компонентов
 
@@ -72,29 +99,68 @@ flowchart TD
     C --> C1[Stage 1: Faces]
     C --> C2[Stage 2: CLIP]
     C --> C3[Stage 3: VLM Caption]
-    A --> V[Video Handler + FFmpeg]
+    A --> V[Video Handler + OpenCV keyframes]
     V --> C
 
-    C1 --> D1[(ChromaDB: collection_faces)]
-    C2 --> D2[(ChromaDB: collection_clip)]
-    C3 --> D3[(SQLite FTS5: media)]
+    C1 --> D1[(Chroma: embeddings_faces)]
+    C2 --> D2[(Chroma: embeddings_clip)]
+    C3 --> D3[(SQLite FTS5: media_fts)]
     V --> D3
 
-    U[Пользовательский запрос] --> P[NLP Parser (Ollama llama3)]
-    P --> H[Hybrid Retriever]
-    H --> D1
-    H --> D2
-    H --> D3
-    H --> R[Reranker]
-    R --> O[Результаты поиска]
+    U[Query] --> H[HybridSearchEngine]
+    H -->|branch 1| D2
+    H -->|branch 2| D1
+    H -->|branch 3| D3
+    H --> R[Per-branch min-max + weighted sum]
+    R --> O[SearchResult list]
 ```
 
-## 4. Оптимизация под RTX 3090 (24GB VRAM)
+## 4. Оптимизация под RTX 3090 (24 GB VRAM)
 
 | Задача | Ресурс VRAM | Технология |
 |---|---:|---|
-| CLIP (ViT-L-14) | ~2.5 GB | Постоянно в памяти (Fast inference) |
-| InsightFace (ONNX) | ~1.0 GB | На CUDA-провайдере |
-| Ollama (Llava/Llama3) | ~8-12 GB | Динамическое управление через Ollama |
+| CLIP (ViT-L-14) | ~2.5 GB | Резидентно |
+| InsightFace (ONNX) | ~1.0 GB | CUDAExecutionProvider |
+| Ollama (moondream2 / llama3) | ~8–12 GB | Управляется самим Ollama |
 | Система/Overhead | ~2.0 GB | Резерв |
-| **Итого** | **~15-18 GB** | **Запас 6-9 GB для стабильной работы** |
+| **Итого** | **~15–18 GB** | Запас 6–9 GB |
+
+`_cleanup_vram()` (gc + `empty_cache`) вызывается только по завершении
+больших батчей — не после каждого запроса. Это даёт 30–70 % throughput на
+ingestion (PERF-N01).
+
+## 5. Безопасность и эксплуатация
+
+- sha256 для скачиваемых артефактов задаётся в `ModelSpec`; downloader
+  верифицирует и zip-архив, и итоговый файл.
+- Zip-распаковка отвергает абсолютные пути и `..` в именах (defensive).
+- Streamlit-вкладка Index пишет прогресс в фоновом потоке; UI периодически
+  опрашивает shared dict и перерисовывает progress-bar. Кнопка Cancel
+  останавливает обход (`asyncio.Event`).
+- Все хард-коды URL/путей вынесены в `Settings` (`pydantic-settings`).
+- Логирование настраивается один раз через `core.logging_config`; `httpx`,
+  `chromadb`, `urllib3` сведены к WARNING, прикладной код — INFO.
+
+## 6. Тестирование и CI
+
+- `tests/` содержит unit-тесты для FTS-санитайзера, dedup/rebind, rerank,
+  ModelDownloader (с httpx-моками и zip-fuzz), индексера (с подменёнными
+  InferenceService/OllamaClient).
+- Heavy native deps (torch, onnxruntime, opencv, insightface, chromadb)
+  stub'аются в `tests/conftest.py` — тесты работают без GPU.
+- GitHub Actions: ruff + black --check + mypy + pytest на Python 3.11 и
+  3.12.
+
+## 7. Future work
+
+Явные пункты, оставленные для следующих итераций (см. план
+`docs/plans/2026-04-22-audit-v2-fixes.md`, §8):
+
+1. Агрегированная сущность «видео» в Chroma (mean-pool эмбеддингов кадров)
+   + миграция схемы v1→v2 с rollback-скриптом.
+2. NLP parser запросов: Ollama `llama3` → JSON intents (person_ref,
+   text_description, location). Добавляется за фиче-флагом.
+3. Батчированный InsightFace (`get_batched` или пул сессий).
+4. Prometheus-метрики и `/healthz` endpoint.
+5. Docker-образ на базе `nvidia/cuda:12.1.0-runtime-ubuntu22.04` с ffmpeg
+   и Python 3.11.

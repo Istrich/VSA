@@ -1,19 +1,25 @@
-"""Runtime compatibility checks for VSA deployment."""
+"""Runtime compatibility checks for VSA deployment.
+
+The checks take the process-wide ``ServiceContainer`` so they never create a
+second ``chromadb.PersistentClient`` for the same directory (BUG-N22). They
+are safe to call from the Streamlit Settings/Status tab.
+"""
 
 from __future__ import annotations
 
 import shutil
-import sqlite3
 import subprocess
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from .db import ChromaVectorStore, SQLiteMetadataDB
-from .models import ModelRegistry
+from .config import Settings, get_settings
+
+if TYPE_CHECKING:
+    from .container import ServiceContainer
 
 
 @dataclass
@@ -25,29 +31,41 @@ class CheckResult:
     details: str
 
 
-def run_compatibility_checks(data_dir: str | Path = "./data") -> list[CheckResult]:
-    """Run all stage checklist checks."""
+def run_compatibility_checks(
+    container: ServiceContainer | None = None,
+    settings: Settings | None = None,
+) -> list[CheckResult]:
+    """Run all stage checklist checks.
+
+    If ``container`` is None the checks fetch the process-wide container so
+    Chroma is not duplicated (BUG-N01/BUG-N22).
+    """
+    from .container import ServiceContainer as _Container
+
+    effective_settings = settings or get_settings()
+    effective_container = container or _Container.get(settings=effective_settings)
+
     results: list[CheckResult] = []
-    results.append(_check_storage_co_location(data_dir))
-    results.append(_check_ollama_health())
+    results.append(_check_storage_co_location(effective_container, effective_settings))
+    results.append(_check_ollama_health(effective_settings.ollama_base_url))
     results.append(_check_onnxruntime_gpu_cuda_compat())
+    results.append(_check_onnxruntime_providers())
     results.append(_check_torch_cuda_runtime())
+    results.append(_check_open_clip_version())
     results.append(_check_ffmpeg_path("ffmpeg"))
     results.append(_check_ffmpeg_path("ffprobe"))
-    results.append(_check_model_files())
+    results.append(_check_model_files(effective_container))
     results.append(_check_chromadb_version())
     return results
 
 
-def _check_storage_co_location(data_dir: str | Path) -> CheckResult:
-    base = Path(data_dir).resolve()
-    metadata_db = SQLiteMetadataDB()
+def _check_storage_co_location(container: ServiceContainer, settings: Settings) -> CheckResult:
+    base = settings.data_dir.resolve()
+    sqlite_path = container.storage.metadata_db.db_path.resolve()
+    chroma_path = container.storage.vector_store.persist_directory.resolve()
 
-    sqlite_path = metadata_db.db_path.resolve()
-    chroma_path = Path("./data/chroma").resolve()
-
-    sqlite_ok = _is_under(sqlite_path, base)
-    chroma_ok = _is_under(chroma_path, base)
+    sqlite_under = _is_under(sqlite_path, base)
+    chroma_under = _is_under(chroma_path, base)
 
     sqlite_ready = False
     chroma_ready = False
@@ -55,37 +73,40 @@ def _check_storage_co_location(data_dir: str | Path) -> CheckResult:
     chroma_error = ""
 
     try:
-        metadata_db.initialize()
-        with sqlite3.connect(sqlite_path) as conn:
-            conn.execute("SELECT 1;")
+        container.storage.metadata_db.initialize()
         sqlite_ready = True
     except Exception as exc:  # pragma: no cover
         sqlite_error = str(exc)
 
     try:
-        vector_store = ChromaVectorStore(persist_directory=chroma_path)
-        vector_store.initialize()
+        container.storage.vector_store.initialize()
+        _ = container.storage.vector_store.clip_collection
+        _ = container.storage.vector_store.face_collection
         chroma_ready = True
     except Exception as exc:  # pragma: no cover
         chroma_error = str(exc)
 
-    ok = sqlite_ok and chroma_ok and sqlite_ready and chroma_ready
+    ok = sqlite_under and chroma_under and sqlite_ready and chroma_ready
     if ok:
         return CheckResult(
-            name="ChromaDB + SQLite in ./data",
+            name="ChromaDB + SQLite co-located under data_dir",
             status="PASS",
             details=f"SQLite: {sqlite_path} | Chroma: {chroma_path}",
         )
 
     details = (
-        f"sqlite_under_data={sqlite_ok}, chroma_under_data={chroma_ok}, "
+        f"sqlite_under_data={sqlite_under}, chroma_under_data={chroma_under}, "
         f"sqlite_ready={sqlite_ready}, chroma_ready={chroma_ready}"
     )
     if sqlite_error:
         details += f" | sqlite_error={sqlite_error}"
     if chroma_error:
         details += f" | chroma_error={chroma_error}"
-    return CheckResult(name="ChromaDB + SQLite in ./data", status="FAIL", details=details)
+    return CheckResult(
+        name="ChromaDB + SQLite co-located under data_dir",
+        status="FAIL",
+        details=details,
+    )
 
 
 def _check_ollama_health(base_url: str = "http://localhost:11434") -> CheckResult:
@@ -118,19 +139,33 @@ def _check_onnxruntime_gpu_cuda_compat() -> CheckResult:
             status="FAIL",
             details="Package `onnxruntime-gpu` is not installed.",
         )
-
     if ort_version.startswith(("1.17.", "1.18.", "1.19.", "1.20.")):
         return CheckResult(
             name="InsightFace / onnxruntime-gpu",
             status="PASS",
-            details=f"onnxruntime-gpu={ort_version} (supported range: 1.17+).",
+            details=f"onnxruntime-gpu={ort_version} (supported range: 1.17–1.20).",
         )
-
     return CheckResult(
         name="InsightFace / onnxruntime-gpu",
         status="WARN",
-        details=f"onnxruntime-gpu={ort_version}; verify CUDA provider compatibility for your host.",
+        details=f"onnxruntime-gpu={ort_version}; verify CUDA provider compatibility.",
     )
+
+
+def _check_onnxruntime_providers() -> CheckResult:
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return CheckResult(
+            name="ONNXRuntime providers",
+            status="FAIL",
+            details="onnxruntime package not importable.",
+        )
+    providers = list(ort.get_available_providers())
+    has_cuda = "CUDAExecutionProvider" in providers
+    status = "PASS" if has_cuda else "WARN"
+    details = f"providers={providers}" + ("" if has_cuda else " (CPU fallback only)")
+    return CheckResult(name="ONNXRuntime providers", status=status, details=details)
 
 
 def _check_torch_cuda_runtime() -> CheckResult:
@@ -142,14 +177,32 @@ def _check_torch_cuda_runtime() -> CheckResult:
             status="FAIL",
             details="Package `torch` is not installed.",
         )
-
     cuda_available = torch.cuda.is_available()
     cuda_version = torch.version.cuda or "unknown"
     status = "PASS" if cuda_available else "WARN"
-    details = f"torch={torch.__version__}, cuda_available={cuda_available}, cuda_version={cuda_version}"
+    details = (
+        f"torch={torch.__version__}, cuda_available={cuda_available}, "
+        f"cuda_version={cuda_version}"
+    )
     if not cuda_available:
         details += " (CPU fallback required)"
     return CheckResult(name="PyTorch runtime", status=status, details=details)
+
+
+def _check_open_clip_version() -> CheckResult:
+    try:
+        version = metadata.version("open_clip_torch")
+    except metadata.PackageNotFoundError:
+        return CheckResult(
+            name="open_clip_torch",
+            status="FAIL",
+            details="Package `open_clip_torch` is not installed.",
+        )
+    return CheckResult(
+        name="open_clip_torch",
+        status="PASS",
+        details=f"open_clip_torch={version}",
+    )
 
 
 def _check_ffmpeg_path(binary_name: str) -> CheckResult:
@@ -160,7 +213,6 @@ def _check_ffmpeg_path(binary_name: str) -> CheckResult:
             status="FAIL",
             details=f"`{binary_name}` executable not found in PATH.",
         )
-
     try:
         proc = subprocess.run(
             [binary, "-version"],
@@ -182,9 +234,8 @@ def _check_ffmpeg_path(binary_name: str) -> CheckResult:
         )
 
 
-def _check_model_files() -> CheckResult:
-    registry = ModelRegistry()
-    status_map = registry.get_model_status()
+def _check_model_files(container: ServiceContainer) -> CheckResult:
+    status_map = container.model_registry.get_model_status()
     missing = [name for name, status in status_map.items() if status != "FOUND"]
     if not missing:
         return CheckResult(
@@ -221,4 +272,3 @@ def _is_under(path: Path, base: Path) -> bool:
         return True
     except ValueError:
         return False
-

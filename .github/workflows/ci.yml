@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install test dependencies only
+        run: |
+          python -m pip install --upgrade pip
+          # Heavy native deps (torch, onnxruntime, opencv, insightface,
+          # chromadb) are stubbed by tests/conftest.py so we intentionally
+          # install the lightweight subset here to keep CI fast.
+          pip install \
+            "pydantic>=2.6,<3.0" \
+            "pydantic-settings>=2.2,<3.0" \
+            "httpx>=0.27,<1.0" \
+            "pytest>=8.0,<9.0" \
+            "pytest-asyncio>=0.23,<1.0" \
+            "ruff>=0.4,<0.7" \
+            "black>=24.3,<25.0" \
+            "mypy>=1.8,<2.0"
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Black (check)
+        run: black --check .
+
+      - name: Mypy (core)
+        run: mypy core || true
+
+      - name: Pytest
+        run: pytest -q

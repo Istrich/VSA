@@ -1,0 +1,29 @@
+# Vision Semantic Archive — docker-compose skeleton.
+# Run with GPU support:
+#   docker compose up --build
+# The compose file assumes a host-mode deployment on a CUDA-capable box;
+# Ollama is expected on the host (or another service) at port 11434.
+
+services:
+  vsa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vsa:latest
+    network_mode: host
+    environment:
+      - VSA_DATA_DIR=/app/data
+      - VSA_MODELS_DIR=/app/models
+      - VSA_INSIGHTFACE_HOME=/app/models/insightface_home
+      - VSA_ALLOW_CPU=false
+      - VSA_OLLAMA_BASE_URL=http://localhost:11434
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
